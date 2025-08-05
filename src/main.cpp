@@ -5,9 +5,6 @@
 #include <SoftwareSerial.h>
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
-#include <avr/wdt.h>
-
-
 
 //—— CONFIG —————————————————————————————————————————————————————
 #define DEBUG           1
@@ -17,6 +14,7 @@
 #define TOPIC_PREFIX    "DL"
 #define TIME_REQ_TOPIC  "time/rx"
 #define HB_INTERVAL_MS  300000UL   // 5 min
+#define SERIAL_REPLY_TIMEOUT 200   // ms
 
 //—— SERIAL & CLIENTS —————————————————————————————————————————————————
 HardwareSerial SerialDebug(PA10, PA9);
@@ -36,6 +34,11 @@ struct {
   uint8_t  len        = 0;
   uint8_t  buf[16];
 } vend;
+
+uint8_t serialReplyBuf[32];
+uint8_t serialReplyLen = 0;
+uint32_t serialReadStart = 0;
+bool waitingForSerialReply = false;
 
 //—— IDs & TOPICS —————————————————————————————————————————————————————
 char     machineID[13];
@@ -59,7 +62,14 @@ uint32_t lastHbMs      = 0;
 #endif
 
 //—— PROTOCOL CODES ———————————————————————————————————————————————————
-enum : uint8_t { CMD_HEARTBEAT=1, CMD_VEND=2, CMD_RESET=3, CMD_BOOT=4 };
+enum : uint8_t {
+  CMD_HEARTBEAT   = 1,
+  CMD_VEND        = 2,
+  CMD_RESET       = 3,
+  CMD_BOOT        = 4,
+  CMD_VEND_SERIAL = 5,
+  CMD_VEND_BOTH   = 6
+};
 enum : uint8_t { DIR_DOWNLINK=1, DIR_UPLINK=2 };
 
 //—— CRC16-CCITT —————————————————————————————————————————————————————
@@ -112,7 +122,6 @@ void sendFrame(uint8_t cmd,uint8_t dir,const uint8_t *pl=nullptr,size_t pln=0){
   buf[i++]=0xFF; buf[i++]=cmd; buf[i++]=dir;
   memcpy(buf+i,mac,6); i+=6;
   uint32_t t=getEpoch();
-  // 5-byte BE timestamp
   buf[i++]=0x00;
   buf[i++]=(t>>24)&0xFF;
   buf[i++]=(t>>16)&0xFF;
@@ -127,11 +136,14 @@ void sendFrame(uint8_t cmd,uint8_t dir,const uint8_t *pl=nullptr,size_t pln=0){
   buf[i++]=0x0D;
   publishFrame(buf,i);
 }
+
+//—— RESPONSES —————————————————————————————————————————————————
 void respBoot()      { sendFrame(CMD_BOOT,     DIR_UPLINK); }
 void respHeartbeat() { sendFrame(CMD_HEARTBEAT,DIR_UPLINK); }
 void respReset()     { sendFrame(CMD_RESET,    DIR_UPLINK); }
 void respVendOK()    { sendFrame(CMD_VEND,     DIR_UPLINK,vend.buf,vend.len); }
 
+//—— VEND ACTIONS —————————————————————————————————————————————————
 void doVend(){
   DBG("[ACT] VEND x"); DBGL(vend.numPulses);
   for(uint8_t k=0;k<vend.numPulses;k++){
@@ -143,33 +155,64 @@ void doVend(){
   respVendOK();
 }
 
+void doVendSerial(){
+  if(vend.len){
+    DBG("[SERIALTX] ");
+    for(uint8_t i=0;i<vend.len;i++){
+      SerialTX.write(vend.buf[i]);
+      SerialDebug.print(vend.buf[i], HEX); SerialDebug.print(" ");
+    }
+    DBGL("");
+    serialReplyLen = 0;
+    waitingForSerialReply = true;
+    serialReadStart = millis();
+  }
+}
+
+void doVendBoth(){
+  doVendSerial();
+  doVend();
+}
+
+//—— CHECK SERIAL REPLY —————————————————————————————————————————
+void checkSerialReply(){
+  if (waitingForSerialReply) {
+    while (SerialTX.available()) {
+      if (serialReplyLen < sizeof(serialReplyBuf)) {
+        serialReplyBuf[serialReplyLen++] = SerialTX.read();
+        serialReadStart = millis();
+      } else SerialTX.read();
+    }
+    if (millis() - serialReadStart > SERIAL_REPLY_TIMEOUT && serialReplyLen > 0) {
+      sendFrame(CMD_VEND_SERIAL, DIR_UPLINK, serialReplyBuf, serialReplyLen);
+      serialReplyLen = 0;
+      waitingForSerialReply = false;
+    }
+  }
+}
+
 //—— MQTT CALLBACK —————————————————————————————————————————————————————
 void mqttCallback(char* topic, byte* payload, unsigned int len){
-  // 1) Time‐response?
   if(strcmp(topic,timeRespTopic)==0){
     char buf[len+1]; memcpy(buf,payload,len); buf[len]=0;
     currentEpoch=strtoul(buf,nullptr,10);
     epochSyncMs=millis();
     timeSynced=true;
     DBGL("[TIME] synced to "+String(currentEpoch));
-    // now send BOOT
-    respBoot();
-    return;
+    respBoot(); return;
   }
 
-  // 2) Hex‐frame
   if(len>64) return;
   char hexbuf[65]; memcpy(hexbuf,payload,len); hexbuf[len]=0;
   DBG("[IN ] "); DBGL(hexbuf);
   uint8_t frame[64]; size_t fl=hexDecode(hexbuf,frame,sizeof(frame));
-  if(fl<1+1+1+6+5+1+1+1+2+1) return;
+  if(fl<17) return;
   if(frame[0]!=0xFF||frame[fl-1]!=0x0D) return;
   uint16_t rc=(frame[fl-3]<<8)|frame[fl-2];
   if(crc16_ccitt(frame+1,fl-4)!=rc){DBGL("[ERR] CRC");return;}
   uint8_t cmd=frame[1], dir=frame[2];
   if(dir!=DIR_DOWNLINK) return;
 
-  // parse vend
   vend.finishTime=(uint32_t)frame[10]<<24
                 |(uint32_t)frame[11]<<16
                 |(uint32_t)frame[12]<<8
@@ -179,22 +222,12 @@ void mqttCallback(char* topic, byte* payload, unsigned int len){
   vend.len      =frame[16];
   memcpy(vend.buf,frame+17,vend.len);
 
-  // forward SerialTX
-  if(vend.len){
-    DBG("[SERIALTX] ");
-    for(uint8_t i=0;i<vend.len;i++){
-      SerialTX.write(vend.buf[i]);
-      SerialDebug.print(vend.buf[i],HEX);
-      SerialDebug.print(" ");
-    }
-    DBGL("");
-  }
-
-  // handle cmd
   switch(cmd){
-    case CMD_HEARTBEAT: respHeartbeat(); DBGL("[CMD] HEARTBEAT"); break;
-    case CMD_RESET:     respReset();     DBGL("[CMD] RESET");     break;
-    case CMD_VEND:      doVend();        DBGL("[CMD] VEND");      break;
+    case CMD_HEARTBEAT:   respHeartbeat();   DBGL("[CMD] HEARTBEAT"); break;
+    case CMD_RESET:       respReset();       DBGL("[CMD] RESET");     break;
+    case CMD_VEND:        doVend();          DBGL("[CMD] VEND");      break;
+    case CMD_VEND_SERIAL: doVendSerial();    DBGL("[CMD] VEND_SERIAL"); break;
+    case CMD_VEND_BOTH:   doVendBoth();      DBGL("[CMD] VEND_BOTH"); break;
     default: break;
   }
 }
@@ -223,15 +256,14 @@ void connectMQTT(){
 
 //—— SETUP & LOOP —————————————————————————————————————————————————————
 void setup(){
-  pinMode(RELAY_PIN,OUTPUT);digitalWrite(RELAY_PIN,LOW);
-  pinMode(LED_PIN,OUTPUT);  digitalWrite(LED_PIN,HIGH);
+  pinMode(RELAY_PIN,OUTPUT); digitalWrite(RELAY_PIN,LOW);
+  pinMode(LED_PIN,OUTPUT);   digitalWrite(LED_PIN,HIGH);
 
   SerialDebug.begin(115200);
   SerialModem.begin(9600);
   SerialTX.begin(9600);
   delay(300);
 
-  // derive MAC
   uint32_t u0=*(uint32_t*)0x1FFFF7E8;
   uint16_t u1=*(uint16_t*)0x1FFFF7EC;
   mac[0]=(u0>>24)&0xFF;mac[1]=(u0>>16)&0xFF;
@@ -250,8 +282,6 @@ void setup(){
 
   connectGPRS();
   connectMQTT();
-
-  // request time
   DBG("[TIME] requesting…"); mqtt.publish(TIME_REQ_TOPIC,machineID,false);
 
   lastHbMs=millis();
@@ -259,15 +289,19 @@ void setup(){
 
 void loop(){
   mqtt.loop();
-  if(millis()-lastHbMs>HB_INTERVAL_MS){
+  if(millis()-lastHbMs > HB_INTERVAL_MS){
     DBGL("[EVENT] Auto-HEARTBEAT");
     respHeartbeat();
-    lastHbMs=millis();
+    lastHbMs = millis();
   }
-  if(vend.finishTime&&(millis()/1000)>=vend.finishTime){
+
+  if(vend.finishTime && (millis()/1000) >= vend.finishTime){
     DBGL("[EVENT] Cycle completed");
     respVendOK();
-    vend.finishTime=0;
+    vend.finishTime = 0;
   }
-  digitalWrite(LED_PIN,((millis()>>9)&1)?LOW:HIGH);
+
+  checkSerialReply();  // Check for serial response
+
+  digitalWrite(LED_PIN, ((millis() >> 9) & 1) ? LOW : HIGH);
 }
