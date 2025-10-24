@@ -5,9 +5,7 @@
 #include <SoftwareSerial.h>
 #include <TinyGsmClient.h>
 #include <PubSubClient.h>
-#include <avr/wdt.h>
-
-
+//#include <avr/wdt.h>
 
 //—— CONFIG —————————————————————————————————————————————————————
 #define DEBUG           1
@@ -242,7 +240,8 @@ void setup(){
     machineID[2*i+1]=hexMap[ mac[i]    &0xF];
   }
   machineID[12]=0;
-  DBG("[ID] ");DBGL(machineID);
+  DBG("[ID] ");
+  DBGL(machineID);
 
   snprintf(topicPub,sizeof(topicPub),"%s/%s/tx",TOPIC_PREFIX,machineID);
   snprintf(topicSub,sizeof(topicSub),"%s/%s/rx",TOPIC_PREFIX,machineID);
